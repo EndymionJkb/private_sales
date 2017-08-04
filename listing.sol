@@ -23,7 +23,7 @@ contract Listing is Pausable {
     uint256 constant OFFER_PRICE_IN_WEI = 0.01 * 1 ether;
     uint16 constant MIN_KEY_LEN = 32;
     // Failsafe to avoid locking up refunds if owner never sells
-    uint constant BID_EXPIRATION_IN_DAYS = 365;
+    uint constant BID_EXPIRATION_IN_DAYS = 545;
     
     enum Status { Active, Contingent, Sold, Expired, Withdrawn }
     
@@ -33,9 +33,14 @@ contract Listing is Pausable {
      *      Only one can be accepted
      * @param buyer - address of buyer
      * @param amountHash - dollar amount of offer (buyers can edit this by resubmitting)
+     * @param mortgageCompany - 3rd party address
+     * @param titleCompany - 3rd party address
      * @param encryptedTerms - terms encrypted with the seller's public key
+     * @param inspectionPeriodInDays - during which buyer can terminate agreement
      * @param dateSubmitted - when the buyer made the offer
      * @param dateAccepted - date the offer was accepted by the seller
+     * @param mortgageCommitment - mortgage approval signaled by 3rd party
+     * @param withdrawn - buyer can withdraw funds after withdrawing their offer
      */
     struct Offer {
         address buyer;
@@ -43,10 +48,11 @@ contract Listing is Pausable {
         address mortgageCompany;
         address titleCompany;
         string encryptedTerms;
+        uint inspectionPeriodInDays; // can be 0
         uint dateSubmitted;
         uint dateAccepted;
-        bool mortgageCommittment;
-        bool titleCommittment;
+        bool mortgageCommitment;
+        bool withdrawn;
     }
 
     // Geographic address of the property (could be a struct, but keep it simple for now)
@@ -77,7 +83,7 @@ contract Listing is Pausable {
     mapping(address => uint256) refunds;
     
     // Don't disclose amount in bid events
-    event LogOfferSubmitted(address indexed buyer, address indexed mortgage, address indexed title, uint date);
+    event LogOfferSubmitted(address indexed buyer, uint inspectionDays, address indexed mortgage, address indexed title, uint date);
     event LogOfferWithdrawn(address indexed buyer, uint date);
     event LogOfferAccepted(address indexed buyer, uint date);
     event LogPropertySold(address indexed buyer, uint date, uint amount);
@@ -112,6 +118,7 @@ contract Listing is Pausable {
         // Identifying information cannot be blank
         require (bytes(_address).length > 0);
         require (listingPeriodInDays >= MINIMUM_LISTING_PERIOD_IN_DAYS);
+        require (listingPeriodInDays < BID_EXPIRATION_IN_DAYS);
         // Can't list properties for free
         require (_price > 0);
         require (bytes(publicKey).length > MIN_KEY_LEN);
@@ -148,16 +155,19 @@ contract Listing is Pausable {
      *      If offer submitted after expiration period, expire the Listing
      * @param amountHash - has of the dollar amount of the offer and a key
      * @param terms - private terms encrypted to seller
+     * @param inspectionDays - days of inspection period (within which buyer can terminate)
+     * @param title - 3rd party address of settlement company
+     * @param mortgage - 3rd party address of mortgage company (if financed)
      */
-    function submitOffer(bytes32 amountHash, string terms, address mortgage, address title) payable onlyActive {
+    function submitOffer(bytes32 amountHash, string terms, uint inspectionDays, address title, address mortgage) payable onlyActive {
         require (offerMap[msg.sender].buyer == 0);
         // You can't bid on your own property
         require (msg.sender != owner);
         // You can't bid nothing (or have a 0 hash)
         require (amountHash > 0);
         require (msg.value >= OFFER_DEPOSIT_IN_WEI);
-        require (bytes32(mortgage).length > 0);
         require (bytes32(title).length > 0);
+        // Mortgage could be empty if it's a cash offer
         
         // Did the Listing expire?
         if (now > expirationDate) {
@@ -166,7 +176,7 @@ contract Listing is Pausable {
             revert();
         }
         
-        var newOffer = Offer(msg.sender, amountHash, mortgage, title, terms, now, 0, false, false);
+        var newOffer = Offer(msg.sender, amountHash, mortgage, title, terms, inspectionDays, now, 0, false, false);
         offers.push(newOffer);
         offerMap[msg.sender] = newOffer;
         refunds[msg.sender] = SafeMath.sub(msg.value, OFFER_PRICE_IN_WEI);
@@ -174,26 +184,30 @@ contract Listing is Pausable {
         feeBalance += OFFER_PRICE_IN_WEI;
         assert(OFFER_PRICE_IN_WEI + refunds[msg.sender] == msg.value);
         
-        LogOfferSubmitted(msg.sender, mortgage, title, newOffer.dateSubmitted);
+        LogOfferSubmitted(msg.sender, inspectionDays, mortgage, title, newOffer.dateSubmitted);
     }
     
     /**
      * @dev Amount must be non-zero and different from the current offer
      * @param amountHash - new amount of the offer
+     * @param mortgage - 3rd party address of mortgage company (if financed)
+     * @param title - 3rd party address of settlement company
+     * @param inspectionDays - days of inspection period (within which buyer can terminate)
      * @param terms - new encrypted terms
      */
-    function updateOffer(bytes32 amountHash, address mortgage, address title, string terms) onlyActive {
+    function updateOffer(bytes32 amountHash, address mortgage, address title, string terms, uint inspectionDays) onlyActive {
         require (offerMap[msg.sender].buyer != 0);
         require (amountHash != 0);
-        require (offerMap[msg.sender].amountHash != amountHash);
+        require (bytes32(title).length != 0);
         assert(msg.sender != owner);
         
         offerMap[msg.sender].amountHash = amountHash;
         offerMap[msg.sender].encryptedTerms = terms;
+        offerMap[msg.sender].inspectionPeriodInDays = inspectionDays;
         offerMap[msg.sender].mortgageCompany = mortgage;
         offerMap[msg.sender].titleCompany = title;
         
-        LogOfferSubmitted(msg.sender, mortgage, title, now);
+        LogOfferSubmitted(msg.sender, inspectionDays, mortgage, title, now);
     }
     
     /**
@@ -203,19 +217,19 @@ contract Listing is Pausable {
         require (offerMap[buyer].buyer != 0);
         require (msg.sender == offerMap[buyer].mortgageCompany);
         
-        offerMap[buyer].mortgageCommittment = true;
+        offerMap[buyer].mortgageCommitment = true;
     }
 
     /**
-     * @dev Signal mortgage approval
+     * @dev Revoke mortgage approval
      */
-    function approveTitle(address buyer) onlyContingent {
+    function revokeMortgageApproval(address buyer) onlyContingent {
         require (offerMap[buyer].buyer != 0);
-        require (msg.sender == offerMap[buyer].titleCompany);
+        require (msg.sender == offerMap[buyer].mortgageCompany);
         
-        offerMap[buyer].titleCommittment = true;
+        offerMap[buyer].mortgageCommitment = false;
     }
-    
+
     /**
      * @dev Withdraw an existing offer -- can only be done by buyer
      *      Can't withdraw after acceptance
@@ -225,13 +239,7 @@ contract Listing is Pausable {
         require(msg.sender != successfulBuyer);
         assert(msg.sender != owner);
         
-        delete offerMap[msg.sender];
-        for (uint idx = 0; idx < offers.length; idx++) {
-            if (offers[idx].buyer == msg.sender) {
-                delete offers[idx];
-                break;
-            }
-        }
+        offerMap[msg.sender].withdrawn = true;
         
         LogOfferWithdrawn(msg.sender, now);
     }
@@ -245,6 +253,7 @@ contract Listing is Pausable {
     function acceptOffer(address winner, uint amount, string key) onlyOwner onlyActive {
         require(offerMap[winner].buyer != 0);
         require(successfulBuyer == 0);
+        assert(offerMap[winner].withdrawn == false);
 
         // Make sure amount matches
         require (keccak256(amount, key) == offerMap[winner].amountHash);
@@ -262,6 +271,8 @@ contract Listing is Pausable {
      * @dev Seller can withdraw the property from the market
      */
     function withdrawListing() onlyOwner onlyActive {
+        assert(successfulBuyer == 0);
+        
         status = Status.Withdrawn;
         
         LogPropertyStatusChange(msg.sender, Status.Active, Status.Withdrawn, "Listing withdrawn");
@@ -269,6 +280,8 @@ contract Listing is Pausable {
 
     /**
      * @dev Seller can extend the listing period
+     *      Note - does not affect the bid expiration period -- otherwise,
+     *             a malicious seller could just extend it forever and lock up deposits
      */
     function extendListing(uint numDays) onlyOwner onlyActive {
         expirationDate = SafeMath.add(expirationDate, numDays * 1 days);
@@ -283,8 +296,11 @@ contract Listing is Pausable {
     function terminateAgreement(string reason) onlyContingent {
         require(msg.sender == successfulBuyer);
         assert(offerMap[successfulBuyer].buyer != 0);
+        // Can only terminate within inspection period
+        require(now <= offerMap[successfulBuyer].dateAccepted + offerMap[successfulBuyer].inspectionPeriodInDays * 1 days);
 
         // Delete the bid entirely; can't accept a bid more than once!
+        // They will have a refund balance, which they can withdraw
         delete offerMap[successfulBuyer];
         for (uint idx = 0; idx < offers.length; idx++) {
             if (offers[idx].buyer == successfulBuyer) {
@@ -295,20 +311,15 @@ contract Listing is Pausable {
         successfulBuyer = 0;
         status = Status.Active;
 
-        // Refund the deposit if the deal falls through
-        var refund = refunds[successfulBuyer];
-        refunds[successfulBuyer] = 0;
-        successfulBuyer.transfer(refund);
-        
         LogPropertyStatusChange(msg.sender, Status.Contingent, Status.Active, reason);
     }
     
     /**
-     * @dev Mark property as sold. Only seller. Maybe require both?
+     * @dev Title company can mark property as sold.
      */
-    function propertySold() onlyOwner onlyContingent {
-        require(offerMap[successfulBuyer].mortgageCommittment == true);
-        require(offerMap[successfulBuyer].titleCommittment == true);
+    function propertySold() onlyContingent {
+        require((offerMap[successfulBuyer].mortgageCompany == 0) || (offerMap[successfulBuyer].mortgageCommitment == true));
+        require(msg.sender == offerMap[successfulBuyer].titleCompany);
         
         assert(successfulBuyer != 0);
         
@@ -335,16 +346,31 @@ contract Listing is Pausable {
      function feeBalanceInquiry() constant returns(uint) {
          return feeBalance;
      }
-     
+    
+    /**
+     * @dev Convenience function so buyers can check whether they're able to withdraw their deposits
+     * @return bool
+     */
+    function canWithdrawDeposit() constant returns(bool) {
+        require (refunds[msg.sender] != 0);
+        
+        bool statusAllowsWithdrawals = (Status.Sold == status) || (Status.Expired == status) || (Status.Withdrawn == status);
+        bool pastTimeLimit = now > refundDate;
+        bool terminatedAgreement = offerMap[msg.sender].buyer == 0;
+        bool withdrewOffer = (offerMap[msg.sender].buyer != 0) && offerMap[msg.sender].withdrawn;
+
+        return statusAllowsWithdrawals || pastTimeLimit || terminatedAgreement || withdrewOffer;
+    } 
+    
     /**
      * @dev Buyers can withdraw their deposits when the property is sold
      *      There is also a time limit, in case the contract gets stuck.
      *      If the listing Expired, it's also "over," so we should allow
-     *      withdrawals.
+     *      withdrawals. If the buyer withdrew their offer, terminated the
+     *      agreement, or the seller withdrew the listing, also allow withdrawals
      */
     function withdrawDeposit() {
-        require ((Status.Sold == status) || (Status.Expired == status) || (now > refundDate));
-        require (refunds[msg.sender] != 0);
+        require (canWithdrawDeposit());
         
         var refund = refunds[msg.sender];
         refunds[msg.sender] = 0;
